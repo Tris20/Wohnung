@@ -1,124 +1,113 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os/exec"
 	"time"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/stealth"
 )
 
 const seenFile = "seen.json"
 
-// loadSeen reads seen IDs from seen.json (or returns empty map)
 func loadSeen() map[string]bool {
-	seen := make(map[string]bool)
-	if data, err := ioutil.ReadFile(seenFile); err == nil {
-		json.Unmarshal(data, &seen)
+	m := map[string]bool{}
+	if b, err := ioutil.ReadFile(seenFile); err == nil {
+		json.Unmarshal(b, &m)
+		log.Printf("[DEBUG] Loaded %d seen IDs\n", len(m))
+	} else {
+		log.Printf("[DEBUG] No seen.json, starting fresh\n")
 	}
-	return seen
+	return m
 }
 
-// saveSeen writes the seen-IDs map back to seen.json
-func saveSeen(seen map[string]bool) {
-	data, _ := json.MarshalIndent(seen, "", "  ")
-	ioutil.WriteFile(seenFile, data, 0644)
-}
-
-// fetchListings uses chromedp to render the page and scrape data-obid attributes
-func fetchListings(ctx context.Context, pageURL string) ([]string, error) {
-	// Navigate + wait for network idle
-	var nodes []*cdp.Node
-	if err := chromedp.Run(ctx,
-		chromedp.Navigate(pageURL),
-		chromedp.Sleep(3*time.Second), // give JS time to load
-		chromedp.Nodes(`div.listing-card[data-obid]`, &nodes, chromedp.ByQueryAll),
-	); err != nil {
-		return nil, err
+func saveSeen(m map[string]bool) {
+	b, _ := json.MarshalIndent(m, "", "  ")
+	if err := ioutil.WriteFile(seenFile, b, 0644); err != nil {
+		log.Printf("[ERROR] writing %s: %v\n", seenFile, err)
+	} else {
+		log.Printf("[DEBUG] Persisted %d seen IDs\n", len(m))
 	}
-
-	// Extract each data-obid
-	var ids []string
-	for _, n := range nodes {
-		for i := 0; i+1 < len(n.Attributes); i += 2 {
-			if n.Attributes[i] == "data-obid" {
-				ids = append(ids, n.Attributes[i+1])
-			}
-		}
-	}
-	return ids, nil
 }
 
-// notifyNew fires a Linux desktop notification
-func notifyNew(obid string) error {
-	title := "New flat listing"
-	body := "ID: " + obid
-	cmd := exec.Command("notify-send", title, body)
-	return cmd.Run()
-}
+func notifySend(id string) {
+	title := fmt.Sprintf("New flat listing: %s", id)
+	body := time.Now().Format("15:04:05 — ID: " + id)
 
-// checkOnce scrapes, notifies on unseen, and updates the seen map
-func checkOnce(ctx context.Context, url string, seen map[string]bool) {
-	ids, err := fetchListings(ctx, url)
+	log.Printf("[DEBUG] notifySend → %q | %q", title, body)
+	cmd := exec.Command(
+		"notify-send",
+		"-u", "critical",
+		title,
+		body,
+	)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Println("Fetch error:", err)
-		return
+		log.Printf("[ERROR] notify-send failed: %v — output: %q", err, out)
+	} else {
+		log.Println("[DEBUG] notify-send succeeded")
 	}
-	for _, id := range ids {
-		if !seen[id] {
-			log.Println("→ New listing found:", id)
-			if err := notifyNew(id); err != nil {
-				log.Println("Notify error:", err)
-			} else {
-				seen[id] = true
-			}
-		}
-	}
-	saveSeen(seen)
+	time.Sleep(200 * time.Millisecond)
 }
 
 func main() {
-	pageURL := "https://www.immobilienscout24.de/Suche/shape/wohnung-mieten?shape=b2FrX0lzd2NwQXB2QX12QWJyRGdsQXBFa3JLZXtAdXtDcVZ7aEZzYUFtRWliQHJWZ3NBdG5AfXNAbntFcWVBY0FraUNuc1F6ZEBkUHxvQWFOcHRAYE47YXF1X0ltY2pwQXRqQWFrRnRsQG1jQGtNX2ZCcmFBcV9CflxlZkNsa0BxX0J8YEB3WHRfQHtyQndsQH1nQV9uQGthQGJIY3FKfW9EfnZBX2hCdn5OYXVBeGJIZkBicURgakBkd0I.&numberofrooms=4.0-&price=1000.0-2200.0&livingspace=70.0-&exclusioncriteria=swapflat&pricetype=rentpermonth&saveSearchId=137791090&sorting=2"
-	intervalMin := 5
+	// 1) Your search URL:
+	pageURL := "https://www.immobilienscout24.de/Suche/shape/wohnung-mieten?shape=b2FrX0lzd2NwQXB2QX12QWJyRGdsQXBFa3JLZXtAdXtDcVZ7aEZzYUFtRWliQHJWZ3NBdG5AfXNAbntFcWVBY0FraUNuc1F6ZEBkUHxvQWFOcHRAYE47YXF1X0ltY2pwQXRqQWFrRnRsQG1jQGtNX2ZCcmFBcV9CflxlZkNsa0BxX0J8YEB3WHRfQHtyQndsQH1nQV9uQGthQGJIY3FKfW9EfnZBX2hCdn5OYXVBeGJIZkBicURgakBkd0I.&numberofrooms=1.0-&price=100.0-2200.0&livingspace=1.0-&exclusioncriteria=swapflat&pricetype=rentpermonth&sorting=2"
 
-	// Ensure notify-send is installed
-	if _, err := exec.LookPath("notify-send"); err != nil {
-		log.Fatal("notify-send not found; install libnotify-bin")
-	}
+	pageURL = "https://www.immobilienscout24.de/Suche/shape/wohnung-mieten?shape=b2FrX0lzd2NwQXB2QX12QWJyRGdsQXBFa3JLZXtAdXtDcVZ7aEZzYUFtRWliQHJWZ3NBdG5AfXNAbntFcWVBY0FraUNuc1F6ZEBkUHxvQWFOcHRAYE47YXF1X0ltY2pwQXRqQWFrRnRsQG1jQGtNX2ZCcmFBcV9CflxlZkNsa0BxX0J8YEB3WHRfQHtyQndsQH1nQV9uQGthQGJIY3FKfW9EfnZBX2hCdn5OYXVBeGJIZkBicURgakBkd0I.&numberofrooms=4.0-&price=1000.0-2200.0&livingspace=70.0-&exclusioncriteria=swapflat&pricetype=rentpermonth&saveSearchId=137791090&sorting=2"
 
-	// Set up a headless Chrome instance
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-	)
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancelAlloc()
+	// 2) Launch headed Chrome via Rod + Launcher
+	u := launcher.New().
+		Headless(false). // ← disable headless
+		Devtools(false). // ← or true if you want DevTools
+		//Add any flags you like:
+		// Set("start-maximized", "").
+		MustLaunch()
 
-	ctx, cancelCtx := chromedp.NewContext(allocCtx)
-	defer cancelCtx()
+	browser := rod.New().ControlURL(u).MustConnect()
+	defer browser.MustClose()
 
-	// (Optional) increase PDFDOM complexity limits, timeouts, etc.
+	// 3) Stealth to further reduce detection
+	page := stealth.MustPage(browser)
 
-	// Prime the session by loading the homepage once (to get cookies/consent)
-	if err := chromedp.Run(ctx,
-		chromedp.Navigate("https://www.immobilienscout24.de/"),
-		chromedp.Sleep(2*time.Second),
-	); err != nil {
-		log.Println("Warning: could not prime session:", err)
-	}
+	// 4) Maximize so you see everything
+	page.MustWindowMaximize()
 
 	seen := loadSeen()
-	ticker := time.NewTicker(time.Duration(intervalMin) * time.Minute)
-	defer ticker.Stop()
+	poll := 5 * time.Minute
 
-	log.Printf("Starting browser-based poller: every %d minutes → %s\n", intervalMin, pageURL)
-	checkOnce(ctx, pageURL, seen) // run immediately
+	log.Printf("→ Opening browser and navigating to search page…\n")
+	page.MustNavigate(pageURL).MustWaitLoad()
 
-	for range ticker.C {
-		checkOnce(ctx, pageURL, seen)
+	log.Printf("→ Starting polling loop every %v\n", poll)
+	for {
+		// 5) Scrape current IDs
+		els, err := page.Elements("div.listing-card[data-obid]")
+		if err != nil {
+			log.Printf("[ERROR] selecting cards: %v\n", err)
+		} else {
+			log.Printf("[DEBUG] Found %d cards\n", len(els))
+			for _, el := range els {
+				if attr, _ := el.Attribute("data-obid"); attr != nil {
+					id := *attr
+					if !seen[id] {
+						log.Printf("[INFO] New listing: %s\n", id)
+						notifySend(id)
+						seen[id] = true
+					}
+				}
+			}
+			saveSeen(seen)
+		}
+
+		// 6) Wait, then reload
+		log.Printf("→ Sleeping %v then reloading…\n", poll)
+		time.Sleep(poll)
+		page.MustReload().MustWaitLoad()
 	}
 }
